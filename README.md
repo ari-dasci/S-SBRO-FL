@@ -32,4 +32,3 @@ conda env create -f environment.yml
 ### Running the Experiment
 
 To start an experiment, navigate to the **[experiment.py](experiments/experiment.py)** file and adjust the parameters as needed for your desired setup. Results will be saved automatically in the **result** folder.
-
