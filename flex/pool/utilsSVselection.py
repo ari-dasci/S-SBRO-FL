@@ -3,6 +3,9 @@ import pulp as pp
 import torch
 import numpy as np
 import itertools
+
+from pkg_resources import non_empty_lines
+
 from flex.pool import collect_clients_weights_pt
 from flex.pool import fed_avg
 from torch.utils.data import DataLoader
@@ -111,7 +114,7 @@ def exact_shapley_value(clients, baseline_performance, val_data, device,*args, *
                 model = model.to(device)
                 # get test data as a torchvision object
                 test_dataloader = DataLoader(
-                    val_data, batch_size=256, shuffle=False, pin_memory=True
+                    val_data, batch_size=128, shuffle=False, pin_memory=True
                 )
                 losses = []
                 with torch.no_grad():
@@ -121,6 +124,8 @@ def exact_shapley_value(clients, baseline_performance, val_data, device,*args, *
                         output = model(data) 
                         pred = output.data.max(1, keepdim=True)[1]
                         test_acc += pred.eq(target.data.view_as(pred)).long().cpu().sum().item()
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
                 test_acc /= total_count
                 subset_acc = test_acc
             cache[subset_key] = subset_acc
@@ -141,7 +146,201 @@ def exact_shapley_value(clients, baseline_performance, val_data, device,*args, *
 
     return shapley_values
 
-def update_reputation(Repuation_dict, Bid_dict, shapley_values,sv_history, ω, ψ, penalty_growth_rate=1.5):
+
+def calculate_loo_contribution(clients, baseline_performance, val_data, device, *args, **kwargs):
+    """
+    Calculates each client's marginal contribution using the Leave-One-Out (LOO) method.
+
+    This is a simplified contribution metric for ablation studies, comparing the performance
+    of the full coalition of selected clients with the performance of the coalition
+    missing just one client.
+
+    Parameters:
+    -----------
+    clients : FlexPool
+        FlexPool containing the selected client models for the current round.
+    baseline_performance : float
+        The performance of the global model from the previous round (before this round's updates).
+    val_data : Dataset
+        The validation dataset to evaluate the model performance.
+    device : str
+        The device to use for model evaluation (e.g., "cuda" or "cpu").
+
+    Returns:
+    --------
+    loo_contributions : dict
+        A dictionary where keys are client_ids and values are their LOO marginal contribution.
+    """
+    selected_ids = clients.actor_ids
+    if not selected_ids:
+        return {}
+
+    loo_contributions = {client_id: 0 for client_id in selected_ids}
+    cache = {}
+
+    def get_subset_value(subset_ids):
+        """
+        Internal helper function to get the performance value of a subset of clients.
+        It uses a cache to avoid re-evaluating the same subset.
+        """
+        subset_key = tuple(sorted(subset_ids))
+        if subset_key in cache:
+            return cache[subset_key]
+
+        if not subset_ids:
+            # If the subset is empty, performance is the baseline from the previous round
+            cache[subset_key] = baseline_performance
+            return baseline_performance
+
+        # Aggregate the models of the clients in the subset
+        subset_params = [collect_clients_weights_pt.__wrapped__(clients._models[client_id]) for client_id in subset_ids]
+        aggregated_params = fed_avg.__wrapped__(subset_params)
+
+        # Create a clean model instance for evaluation
+        model = copy.deepcopy(clients._models[subset_ids[0]]['model'])
+        weight_dict = model.state_dict()
+        for layer_key, new_weights in zip(weight_dict, aggregated_params):
+            try:
+                if len(new_weights) != 0:
+                    weight_dict[layer_key].copy_(new_weights)
+            except TypeError:
+                weight_dict[layer_key].copy_(new_weights)
+
+        # Evaluate the aggregated model
+        model.eval()
+        model = model.to(device)
+        test_dataloader = DataLoader(val_data, batch_size=256, shuffle=False, pin_memory=True)
+
+        test_acc = 0
+        total_count = 0
+        with torch.no_grad():
+            for data, target in test_dataloader:
+                total_count += target.size(0)
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                pred = output.data.max(1, keepdim=True)[1]
+                test_acc += pred.eq(target.data.view_as(pred)).long().cpu().sum().item()
+
+        accuracy = test_acc / total_count if total_count > 0 else 0.0
+        cache[subset_key] = accuracy
+        return accuracy
+
+    # 1. Calculate the performance of the grand coalition (all selected clients)
+    v_S = get_subset_value(selected_ids)
+
+    # 2. Iterate through each client to calculate their marginal contribution
+    for client_id in selected_ids:
+        # Create the coalition without the current client
+        subset_minus_client = [cid for cid in selected_ids if cid != client_id]
+
+        # Calculate the performance of the coalition without the client
+        v_S_minus_i = get_subset_value(subset_minus_client)
+
+        # The LOO contribution is the performance drop when the client is removed
+        marginal_contribution = v_S - v_S_minus_i
+        loo_contributions[client_id] = marginal_contribution
+
+    return loo_contributions
+
+
+def calculate_tmc_shapley(clients, baseline_performance, val_data, device, *args, **kwargs):
+    """
+    使用截断蒙特卡洛（TMC）方法近似计算每个客户端的Shapley值。
+
+    该方法通过对客户端排列进行随机抽样来估算边际贡献，
+    从而避免了精确计算的指数级复杂度。
+
+    Args:
+        clients (FlexPool): 包含当前轮次被选中客户端模型的池。
+        baseline_performance (float): 上一轮的全局模型性能（基线）。
+        val_data (Dataset): 用于评估模型性能的验证数据集。
+        device (str): "cuda" 或 "cpu"。
+        *args, **kwargs: 可选参数，其中 'mc_iterations' 用于指定蒙特卡洛迭代次数。
+
+    Returns:
+        dict: 一个字典，键是客户端ID，值是其近似的Shapley值。
+    """
+    selected_ids = clients.actor_ids
+    if not selected_ids:
+        return {}
+
+    # 从kwargs获取迭代次数，如果没有则设置一个合理的默认值
+    mc_iterations = kwargs.get('mc_iterations', 20 * len(selected_ids))
+
+    tmc_shapley_values = {client_id: 0.0 for client_id in selected_ids}
+    cache = {}  # 用于缓存已计算过的子集性能，提高效率
+
+    def get_subset_performance(subset_ids):
+        """内部辅助函数，用于评估给定客户端子集的模型性能。"""
+        subset_key = tuple(sorted(subset_ids))
+        if subset_key in cache:
+            return cache[subset_key]
+
+        if not subset_ids:
+            return baseline_performance
+
+        # 聚合模型
+        subset_params = [collect_clients_weights_pt.__wrapped__(clients._models[cid]) for cid in subset_ids]
+        aggregated_params = fed_avg.__wrapped__(subset_params)
+
+        model = copy.deepcopy(clients._models[selected_ids[0]]['model'])
+        weight_dict = model.state_dict()
+        for layer_key, new_weights in zip(weight_dict, aggregated_params):
+            try:
+                if len(new_weights) != 0: weight_dict[layer_key].copy_(new_weights)
+            except TypeError:
+                weight_dict[layer_key].copy_(new_weights)
+
+        # 评估模型
+        model.eval()
+        model = model.to(device)
+        test_dataloader = DataLoader(val_data, batch_size=256, shuffle=False, pin_memory=True)
+
+        test_acc = 0
+        total_count = 0
+        with torch.no_grad():
+            for data, target in test_dataloader:
+                total_count += target.size(0)
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                pred = output.data.max(1, keepdim=True)[1]
+                test_acc += pred.eq(target.data.view_as(pred)).long().cpu().sum().item()
+
+        accuracy = test_acc / total_count if total_count > 0 else 0.0
+        cache[subset_key] = accuracy
+        return accuracy
+
+    # TMC-Shapley 主循环
+    for _ in range(mc_iterations):
+        # 随机生成一个客户端排列
+        shuffled_ids = random.sample(selected_ids, len(selected_ids))
+
+        preceding_coalition_perf = baseline_performance
+
+        for i in range(len(shuffled_ids)):
+            client_id = shuffled_ids[i]
+
+            # 包含当前客户端的联盟
+            current_coalition_ids = shuffled_ids[:i + 1]
+            current_coalition_perf = get_subset_performance(current_coalition_ids)
+
+            # 计算边际贡献
+            marginal_contribution = current_coalition_perf - preceding_coalition_perf
+
+            # 累加贡献值以计算平均值
+            tmc_shapley_values[client_id] += marginal_contribution
+
+            # 更新前序联盟的性能
+            preceding_coalition_perf = current_coalition_perf
+
+    # 计算Shapley值的平均值
+    for client_id in tmc_shapley_values:
+        tmc_shapley_values[client_id] /= mc_iterations
+
+    return tmc_shapley_values
+
+
+def update_reputation(Repuation_dict, Bid_dict, shapley_values,sv_history, ω, ψ, window, penalty_growth_rate=1.5):
     """
     Update reputation of nodes based on Shapley values, bid prices, and performance history.
 
@@ -167,7 +366,7 @@ def update_reputation(Repuation_dict, Bid_dict, shapley_values,sv_history, ω, �
     sum_positive_bid = sum(Bid_dict[node_id] for node_id, sv in shapley_values.items() if sv > 0)
     for node_id, sv in shapley_values.items():
         if sv <= 0:
-            recent_values = sv_history[node_id][-5:]
+            recent_values = sv_history[node_id][-window:]
             # 计算小于0的次数
             recent_errors = sum(1 for v in recent_values if v < 0)
             # Update bad count
@@ -180,6 +379,7 @@ def update_reputation(Repuation_dict, Bid_dict, shapley_values,sv_history, ω, �
         # Update reputation
         if node_id in Repuation_dict:
             Repuation_dict[node_id].append(Repuation_dict[node_id][-1] + UD)
+
 
 def select_nodes(Reputation_dict, Bid_dict, Budget, γ=-2.5, α=0.3, β=0.9, round=1, participation_count_5rounds={}):
     #   convert the reputation values to weights using the prospect theory function
@@ -215,6 +415,72 @@ def select_nodes(Reputation_dict, Bid_dict, Budget, γ=-2.5, α=0.3, β=0.9, rou
 
     # get the selected node IDs
     selected_nodes = [node_id for node_id in Reputation_dict.keys() if pp.value(x[node_id]) == 1]
+
+    # ----- roll back -----
+    if not selected_nodes:
+       #  if no nodes are selected, re-run the optimization without the weight threshold constraint
+        m2 = pp.LpProblem(sense=pp.LpMaximize)
+        m2 += pp.lpSum([(W[node_id] + epsilon) * x[node_id] for node_id in Reputation_dict.keys()])
+        m2 += pp.lpSum([Bid_dict[node_id] * x[node_id] for node_id in Reputation_dict.keys()]) <= Budget
+        #  remove the weight threshold constraint
+        m2.solve(pp.PULP_CBC_CMD(msg=False))
+        selected_nodes = [node_id for node_id in Reputation_dict.keys() if pp.value(x[node_id]) == 1]
+
+    return selected_nodes
+
+def select_nodes_linear_nofilter(Reputation_dict, Bid_dict, Budget, participation_count_5rounds={}):
+    """
+    Robust version with status check and safe fallback.
+    """
+
+    # === Calculate weights ===
+    W = {node_id: rep_list[-1] for node_id, rep_list in Reputation_dict.items()}
+
+    min_W = min(W.values())
+    W = {k: v - min_W for k, v in W.items()}
+
+    # === Create optimization problem ===
+    m = pp.LpProblem("ClientSelection_Linear", sense=pp.LpMaximize)
+    x = {node_id: pp.LpVariable(f'x_{node_id}', cat='Binary') for node_id in Reputation_dict.keys()}
+
+    epsilon = 1e-6
+    # Objective
+    m += pp.lpSum([(W[node_id] + epsilon) * x[node_id] for node_id in Reputation_dict.keys()])
+
+    # Budget constraint
+    m += pp.lpSum([Bid_dict[node_id] * x[node_id] for node_id in Reputation_dict.keys()]) <= Budget
+
+    # === Solve ===
+    m.solve(pp.PULP_CBC_CMD(msg=False))
+
+    # === Check status ===
+    if m.status != 1:
+        print(f"[WARNING] Solver status not optimal: {pp.LpStatus[m.status]}")
+        selected_nodes = []
+    else:
+        selected_nodes = [node_id for node_id in Reputation_dict.keys() if pp.value(x[node_id]) == 1]
+
+    # === Fallback if no nodes selected ===
+    if not selected_nodes:
+        print("[INFO] Triggering fallback selection (without hard threshold).")
+
+        # Redefine problem & variables
+        m2 = pp.LpProblem("ClientSelection_Linear_Fallback", sense=pp.LpMaximize)
+        x2 = {node_id: pp.LpVariable(f'x2_{node_id}', cat='Binary') for node_id in Reputation_dict.keys()}
+
+        # Objective
+        m2 += pp.lpSum([(W[node_id] + epsilon) * x2[node_id] for node_id in Reputation_dict.keys()])
+
+        # Budget constraint only
+        m2 += pp.lpSum([Bid_dict[node_id] * x2[node_id] for node_id in Reputation_dict.keys()]) <= Budget
+
+        m2.solve(pp.PULP_CBC_CMD(msg=False))
+
+        if m2.status != 1:
+            print(f"[WARNING] Fallback solver status not optimal: {pp.LpStatus[m2.status]}")
+            selected_nodes = []
+        else:
+            selected_nodes = [node_id for node_id in Reputation_dict.keys() if pp.value(x2[node_id]) == 1]
 
     return selected_nodes
 
